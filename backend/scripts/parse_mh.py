@@ -4,11 +4,8 @@ import re
 import os
 from pathlib import Path
 
-# Pattern to identify college lines like "01002 - Government College of Engineering, Amravati"
-COLLEGE_PATTERN = re.compile(r'^(\d{5})\s*-\s*(.+)$')
-
-# Pattern to identify branch lines like "0100219110 - Civil Engineering"
-BRANCH_PATTERN = re.compile(r'^(\d{10})\s*-\s*(.+)$')
+COLLEGE_PATTERN = re.compile(r'^(\d{4,5})\s*-\s*(.+)$')
+BRANCH_PATTERN = re.compile(r'^(\d{9,10})\s*-\s*(.+)$')
 
 def parse_cell(cell_value):
     """
