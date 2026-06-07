@@ -2,14 +2,18 @@ import pandas as pd
 from pathlib import Path
 
 processed_path = Path(__file__).parent.parent / 'data' / 'processed'
-df = pd.read_csv(processed_path / 'chunks.csv')
+df = pd.read_csv(processed_path / 'mh_cutoffs.csv')
 
-# Find COEP in MH data
-coep = df[
-    (df['college_name'].str.contains('COEP', case=False, na=False)) |
-    (df['college_name'].str.contains('College of Engineering, Pune', case=False, na=False))
+# Search all branches containing 'computer' across all colleges
+computer = df[df['branch_name'].str.contains('Computer', case=False, na=False)]
+
+print(f"Total Computer branches: {len(computer)}")
+print(f"\nUnique branch names containing Computer:")
+print(computer['branch_name'].unique())
+print(f"\nColleges with CS that have high cutoffs (percentile > 95):")
+high = computer[
+    (computer['category'] == 'GOPENS') & 
+    (computer['percentile'] > 95) &
+    (computer['year'] == 2025)
 ]
-
-print(f"COEP records found: {len(coep)}")
-print("\nUnique college names matching COEP:")
-print(coep['college_name'].unique())
+print(high[['college_name', 'branch_name', 'percentile']].sort_values('percentile', ascending=False).head(10).to_string())

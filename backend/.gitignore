@@ -6,3 +6,4 @@ chroma_db/
 backend/data/processed/
 backend/data/raw/
 backend/chroma_db/
+data/
