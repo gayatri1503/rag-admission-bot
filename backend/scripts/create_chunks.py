@@ -47,16 +47,35 @@ def create_mh_chunks(df):
     """Convert MH cutoff records into readable text chunks"""
     chunks = []
 
+    branch_aliases = {
+        'Computer Science and Engineering': 'CS CSE Computer Science',
+        'Information Technology': 'IT Information Technology',
+        'Electronics and Telecommunication Engg': 'EXTC Electronics Telecommunication',
+        'Mechanical Engineering': 'Mechanical MECH',
+        'Civil Engineering': 'Civil CE',
+        'Electrical Engineering': 'Electrical EE',
+        'Computer Engineering': 'CS CSE Computer',
+        'Artificial Intelligence': 'AI Artificial Intelligence',
+        'Data Science': 'DS Data Science',
+    }
+
     for _, row in df.iterrows():
         category_name = get_category_name(str(row['category']))
-        
+        college_short = str(row['college_name']).split(',')[0].strip()
+        branch_alias = branch_aliases.get(str(row['branch_name']), '')
+
+        city = ''
+        if ',' in str(row['college_name']):
+            city = str(row['college_name']).split(',')[-1].strip()
+
         chunk = (
             f"In {row['year']} CAP Round {row['round']}, "
-            f"{row['college_name']} offered {row['branch_name']} "
+            f"{row['college_name']} ({college_short}) offered {row['branch_name']} {branch_alias} "
             f"with a closing percentile of {row['percentile']:.2f} "
             f"for the {category_name} ({row['category']}) category. "
             f"The closing rank was {row['rank']}. "
-            f"This is Maharashtra state level data."
+            f"Location: {city}, Maharashtra. "
+            f"Year: {row['year']}, Round: {row['round']}."
         )
 
         chunks.append({
