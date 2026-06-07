@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 chroma_db/
+backend/data/processed/
+backend/data/raw/
+backend/chroma_db/
