@@ -100,3 +100,34 @@ if __name__ == "__main__":
         expanded = expand_query(query)
         print(f"Expanded: {expanded}")
         print()
+
+def detect_category(query_lower):
+    """
+    Detect which reservation category the student belongs to
+    from their query.
+    """
+    category_map = {
+        'open': 'GOPENS',
+        'general': 'GOPENS',
+        'obc': 'GOBCS',
+        'sc': 'GSCS',
+        'st': 'GSTS',
+        'ews': 'EWS',
+        'tfws': 'TFWS',
+        'sebc': 'GSEBCS',
+        'nt1': 'GNT1S',
+        'nt2': 'GNT2S',
+        'nt3': 'GNT3S',
+        'vj': 'GVJS',
+        'ladies': 'LOPENS',
+        'girl': 'LOPENS',
+        'female': 'LOPENS',
+        'pwd': 'PWDOPENS',
+        'defence': 'DEFOPENS',
+    }
+
+    for keyword, code in category_map.items():
+        if keyword in query_lower:
+            return code
+
+    return None        

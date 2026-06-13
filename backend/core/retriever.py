@@ -15,87 +15,120 @@ print("Model ready.")
 client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = client.get_collection("admission_data")
 
-def detect_filters(query_lower, expanded_query):
-    """
-    Detect if query mentions a specific college or category
-    and return ChromaDB metadata filters
-    """
-    from expander import COLLEGE_ALIASES, CATEGORY_ALIASES
+def detect_filters(query_lower):
+    from expander import COLLEGE_ALIASES, detect_category
 
-    filters = {}
+    type_filter = None
+    college_filter = None
+    category_filter = None
 
-    # Check if a specific college is mentioned
+    # Detect seat type
+    if any(w in query_lower for w in ['cet', 'mht cet', 'state quota', 'mh quota']):
+        type_filter = 'MH'
+    elif any(w in query_lower for w in ['jee', 'all india', 'ai quota', 'ai seats']):
+        type_filter = 'AI'
+
+    # Detect college
     for alias, full_name in COLLEGE_ALIASES.items():
         if alias in query_lower:
-            filters['college_name'] = full_name
+            college_filter = full_name
             break
 
-    return filters if filters else None
+    # Detect category
+    category_filter = detect_category(query_lower)
 
-def retrieve(query, n_results=5, filters=None):
+    return type_filter, college_filter, category_filter
+
+def retrieve(query, n_results=5, where=None):
     query_embedding = model.encode(query).tolist()
+
+    # Request more results than needed to allow diversity filtering
+    fetch_count = min(n_results * 4, 100)
 
     search_kwargs = {
         "query_embeddings": [query_embedding],
-        "n_results": n_results,
+        "n_results": fetch_count,
         "include": ["documents", "metadatas", "distances"]
     }
 
-    if filters:
-        search_kwargs["where"] = filters
+    if where:
+        search_kwargs["where"] = where
 
     results = collection.query(**search_kwargs)
 
+    # Build chunks with deduplication by college name
+    seen_colleges = {}
     chunks = []
+
     for i in range(len(results['documents'][0])):
-        chunks.append({
-            'text': results['documents'][0][i],
-            'metadata': results['metadatas'][0][i],
-            'relevance_score': 1 - results['distances'][0][i]
-        })
+        college = results['metadatas'][0][i].get('college_name', '')
+        text = results['documents'][0][i]
+        score = 1 - results['distances'][0][i]
+        metadata = results['metadatas'][0][i]
+
+        # Allow max 2 chunks per college for diversity
+        count = seen_colleges.get(college, 0)
+        if count < 2:
+            chunks.append({
+                'text': text,
+                'metadata': metadata,
+                'relevance_score': score
+            })
+            seen_colleges[college] = count + 1
+
+        if len(chunks) >= n_results:
+            break
 
     return chunks
 
 def retrieve_with_expansion(user_query, n_results=5):
-    """
-    Full pipeline — expand query then retrieve with smart filters
-    """
     from expander import expand_query
+    import re
 
     query_lower = user_query.lower()
-
-    # Expand the query
     expanded = expand_query(user_query)
 
-    # Detect filters from original query
-    filters = detect_filters(query_lower, expanded)
+    type_filter, college_filter, category_filter = detect_filters(query_lower)
 
-    print(f"Filters applied: {filters}")
+    print(f"Type: {type_filter}, College: {college_filter}, Category: {category_filter}")
 
-    # Try filtered search first
-    if filters:
+    percentile_match = re.search(r'(\d{2,3}(?:\.\d+)?)\s*percentile', query_lower)
+    user_percentile = float(percentile_match.group(1)) if percentile_match else None
+
+    print(f"Percentile: {user_percentile}")
+
+    conditions = []
+
+    if type_filter:
+        conditions.append({"type": {"$eq": type_filter}})
+    if college_filter:
+        conditions.append({"college_name": {"$eq": college_filter}})
+    if category_filter:
+        conditions.append({"category": {"$eq": category_filter}})
+    if user_percentile:
+        conditions.append({"percentile": {"$gte": user_percentile - 10}})
+        conditions.append({"percentile": {"$lte": user_percentile + 10}})
+
+    where = None
+    if len(conditions) == 1:
+        where = conditions[0]
+    elif len(conditions) > 1:
+        where = {"$and": conditions}
+
+    if where:
         try:
-            results = retrieve(expanded, n_results=n_results, filters=filters)
+            results = retrieve(expanded, n_results=n_results, where=where)
             if results:
                 return results
         except Exception as e:
-            print(f"Filtered search failed: {e}, falling back to unfiltered")
+            print(f"Filtered search failed: {e}")
+            # Retry without percentile filter
+            non_percentile = [c for c in conditions if "percentile" not in str(c)]
+            if non_percentile:
+                where2 = non_percentile[0] if len(non_percentile) == 1 else {"$and": non_percentile}
+                try:
+                    return retrieve(expanded, n_results=n_results, where=where2)
+                except:
+                    pass
 
-    # Fall back to unfiltered if no filters or filtered returned nothing
     return retrieve(expanded, n_results=n_results)
-
-if __name__ == "__main__":
-    test_queries = [
-        "COEP CS cutoff general 2025",
-        "vjti mechanical obc cutoff",
-        "colleges with 85 percentile sc category",
-    ]
-
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        results = retrieve_with_expansion(query, n_results=3)
-        print()
-        for i, chunk in enumerate(results):
-            print(f"Result {i+1} (relevance: {chunk['relevance_score']:.3f}):")
-            print(chunk['text'])
-            print()

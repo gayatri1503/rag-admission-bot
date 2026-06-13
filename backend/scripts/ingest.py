@@ -1,17 +1,12 @@
-import pandas as pd
-import chromadb
-from sentence_transformers import SentenceTransformer
+import sys
 from pathlib import Path
-import time
+sys.path.append(str(Path(__file__).parent.parent))
+from config import INGEST_YEARS, INGEST_ROUNDS, INGEST_CATEGORIES
 
-# Filter settings — same as what we tested
-KEEP_YEARS = [2024, 2025]
-KEEP_ROUNDS = [1]
-KEEP_CATEGORIES = [
-    'GOPENS', 'GSCS', 'GSTS', 'GOBCS', 'GSEBCS',
-    'LOPENS', 'TFWS', 'EWS', 'GNT1S', 'GNT2S',
-    'GNT3S', 'GVJS', 'LOBCS', 'AI'
-]
+# Use config values instead of hardcoded lists
+KEEP_YEARS = INGEST_YEARS
+KEEP_ROUNDS = INGEST_ROUNDS
+KEEP_CATEGORIES = INGEST_CATEGORIES
 
 def load_filtered_chunks(processed_path):
     print("Loading chunks...")
