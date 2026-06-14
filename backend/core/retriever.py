@@ -1,17 +1,33 @@
 import chromadb
-from sentence_transformers import SentenceTransformer
-from pathlib import Path
-import sys
 import os
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import requests
+from pathlib import Path
 
 CHROMA_PATH = Path(__file__).parent.parent / 'chroma_db'
 
-print("Loading embedding model...")
-model = SentenceTransformer('all-MiniLM-L6-v2')
-print("Model ready.")
+HF_API_KEY = os.getenv("HF_API_KEY", "")
+HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 
+def get_embedding(text):
+    """Get embedding via HuggingFace API in production, local model in development"""
+    if HF_API_KEY:
+        # Production — use HF API
+        response = requests.post(
+            HF_API_URL,
+            headers={"Authorization": f"Bearer {HF_API_KEY}"},
+            json={"inputs": text, "options": {"wait_for_model": True}}
+        )
+        return response.json()
+    else:
+        # Development — use local model
+        from sentence_transformers import SentenceTransformer
+        if not hasattr(get_embedding, '_model'):
+            print("Loading embedding model...")
+            get_embedding._model = SentenceTransformer('all-MiniLM-L6-v2')
+            print("Model ready.")
+        return get_embedding._model.encode(text).tolist()
+
+print("Retriever initialized.")
 client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = client.get_collection("admission_data")
 
@@ -40,9 +56,10 @@ def detect_filters(query_lower):
     return type_filter, college_filter, category_filter
 
 def retrieve(query, n_results=5, where=None):
-    query_embedding = model.encode(query).tolist()
+    query_embedding = get_embedding(query)
+    if isinstance(query_embedding[0], list):
+        query_embedding = query_embedding[0]
 
-    # Request more results than needed to allow diversity filtering
     fetch_count = min(n_results * 4, 100)
 
     search_kwargs = {
@@ -56,17 +73,15 @@ def retrieve(query, n_results=5, where=None):
 
     results = collection.query(**search_kwargs)
 
-    # Build chunks with deduplication by college name
     seen_colleges = {}
     chunks = []
 
     for i in range(len(results['documents'][0])):
         college = results['metadatas'][0][i].get('college_name', '')
-        text = results['documents'][0][i]
         score = 1 - results['distances'][0][i]
         metadata = results['metadatas'][0][i]
+        text = results['documents'][0][i]
 
-        # Allow max 2 chunks per college for diversity
         count = seen_colleges.get(college, 0)
         if count < 2:
             chunks.append({
