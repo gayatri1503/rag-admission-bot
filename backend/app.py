@@ -4,8 +4,12 @@ import re
 import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from groq import Groq
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import timedelta
 
 load_dotenv()
 
@@ -15,7 +19,18 @@ from retriever import retrieve_with_expansion
 from generator import generate_answer
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["http://localhost:5173"])
+
+# Config
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///admissions.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'mhtcet-secret-key-change-in-production')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
+
+# Init extensions
+from models import db, User, Chat, Message
+db.init_app(app)
+jwt = JWTManager(app)
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -112,13 +127,6 @@ Example: ["Question 1?", "Question 2?", "Question 3?", "Question 4?"]"""
     ]
 
 def categorize_chunks(chunks, user_percentile):
-    """
-    Categorize retrieved chunks based on percentile comparison.
-    Python does the math — not the LLM.
-    safe      = cutoff <= student percentile (student qualifies)
-    ambitious = cutoff is 1-5 points above student percentile
-    out_of_reach = cutoff more than 5 points above
-    """
     safe = []
     ambitious = []
     out_of_reach = []
@@ -146,133 +154,309 @@ def categorize_chunks(chunks, user_percentile):
 
     return safe, ambitious, out_of_reach
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
+def process_chat_message(user_message):
+    """Core RAG pipeline — returns answer, sources, suggestions"""
+    # Reject gibberish — must have at least 3 real words or a meaningful query
+    words = [w for w in user_message.split() if len(w) > 1]
+    if len(words) < 2 or len(user_message) < 8:
+        return (
+            "I didn't quite understand that. Could you please ask a specific question about Maharashtra engineering admissions? For example: 'Which colleges can I get with 85 percentile in OBC category?'",
+            [],
+            [
+                "Colleges for 85 percentile general category?",
+                "VJTI cutoff for OBC 2025?",
+                "What documents do I need for CAP Round 1?",
+                "Explain freeze, float and slide options",
+            ]
+        )
+    if is_non_cutoff_query(user_message):
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": DOCUMENT_KNOWLEDGE},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=600,
+            temperature=0.3
+        )
+        answer = response.choices[0].message.content.strip()
+        sources = []
+    else:
+        percentile_match = re.search(
+            r'(\d{2,3}(?:\.\d+)?)\s*percentile',
+            user_message.lower()
+        )
+        user_percentile = float(percentile_match.group(1)) if percentile_match else None
 
-@app.route('/chat', methods=['POST'])
-def chat():
+        chunks = retrieve_with_expansion(user_message, n_results=20)
+
+        if user_percentile:
+            safe, ambitious, out_of_reach = categorize_chunks(chunks, user_percentile)
+
+            context_parts = []
+            if safe:
+                context_parts.append("=== SAFE OPTIONS (cutoff BELOW student percentile) ===")
+                for c in safe[:5]:
+                    m = c['metadata']
+                    context_parts.append(
+                        f"SAFE | {m['college_name']} | {m['branch_name']} | "
+                        f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
+                        f"{m['year']} Round {m['round']}"
+                    )
+            if ambitious:
+                context_parts.append("=== AMBITIOUS OPTIONS (cutoff 1-5 points above) ===")
+                for c in ambitious[:3]:
+                    m = c['metadata']
+                    context_parts.append(
+                        f"AMBITIOUS | {m['college_name']} | {m['branch_name']} | "
+                        f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
+                        f"{m['year']} Round {m['round']}"
+                    )
+            if out_of_reach:
+                context_parts.append("=== OUT OF REACH ===")
+                for c in out_of_reach[:2]:
+                    m = c['metadata']
+                    context_parts.append(
+                        f"OUT OF REACH | {m['college_name']} | {m['branch_name']} | "
+                        f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
+                        f"{m['year']} Round {m['round']}"
+                    )
+
+            structured_context = "\n".join(context_parts)
+            prompt = f"""Student's MHT CET percentile: {user_percentile}
+Student's question: {user_message}
+
+I have already done the math correctly. Here is the pre-categorized data:
+
+{structured_context}
+
+IMPORTANT RULES:
+- Copy the categorization EXACTLY as given above. SAFE means SAFE, AMBITIOUS means AMBITIOUS.
+- Do NOT move any college from one category to another.
+- Do NOT recalculate anything.
+- Show the exact cutoff percentile for every college.
+- Present in this order: Safe options first, then Ambitious, then Out of Reach.
+- End with a recommendation."""
+
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=600,
+                temperature=0.2
+            )
+            answer = response.choices[0].message.content.strip()
+            all_chunks = safe + ambitious + out_of_reach
+        else:
+            answer = generate_answer(user_message, chunks)
+            all_chunks = chunks
+
+        sources = [{
+            'college': c['metadata'].get('college_name', ''),
+            'branch': c['metadata'].get('branch_name', ''),
+            'year': c['metadata'].get('year', ''),
+            'category': c['metadata'].get('category', ''),
+            'percentile': c['metadata'].get('percentile', ''),
+            'relevance': round(c['relevance_score'], 3)
+        } for c in all_chunks[:5]]
+
+    suggestions = generate_followup_suggestions(user_message, answer)
+    return answer, sources, suggestions
+
+# ─── Auth Routes ────────────────────────────────────────────
+
+@app.route('/auth/register', methods=['POST'])
+def register():
     try:
         data = request.get_json()
+        name = data.get('name', '').strip()
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '')
+
+        if not name or not email or not password:
+            return jsonify({'error': 'Name, email and password are required'}), 400
+
+        if len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+
+        if User.query.filter_by(email=email).first():
+            return jsonify({'error': 'Email already registered'}), 400
+
+        user = User(
+            name=name,
+            email=email,
+            password_hash=generate_password_hash(password)
+        )
+        db.session.add(user)
+        db.session.commit()
+
+        token = create_access_token(identity=str(user.id))
+        return jsonify({
+            'token': token,
+            'user': user.to_dict()
+        }), 201
+
+    except Exception as e:
+        print(f"Register error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/auth/login', methods=['POST'])
+def login():
+    try:
+        data = request.get_json()
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '')
+
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
+
+        user = User.query.filter_by(email=email).first()
+        if not user or not check_password_hash(user.password_hash, password):
+            return jsonify({'error': 'Invalid email or password'}), 401
+
+        token = create_access_token(identity=str(user.id))
+        return jsonify({
+            'token': token,
+            'user': user.to_dict()
+        })
+
+    except Exception as e:
+        print(f"Login error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/auth/me', methods=['GET'])
+@jwt_required()
+def me():
+    user_id = get_jwt_identity()
+    user = User.query.get(int(user_id))
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({'user': user.to_dict()})
+
+# ─── Chat History Routes ─────────────────────────────────────
+
+@app.route('/chats', methods=['GET'])
+@jwt_required()
+def get_chats():
+    user_id = get_jwt_identity()
+    chats = Chat.query.filter_by(user_id=int(user_id)).order_by(Chat.updated_at.desc()).all()
+    return jsonify({'chats': [c.to_dict() for c in chats]})
+
+@app.route('/chats', methods=['POST'])
+@jwt_required()
+def create_chat():
+    user_id = get_jwt_identity()
+    chat = Chat(user_id=int(user_id), title='New conversation')
+    db.session.add(chat)
+    db.session.commit()
+    return jsonify({'chat': chat.to_dict()}), 201
+
+@app.route('/chats/<int:chat_id>', methods=['DELETE'])
+@jwt_required()
+def delete_chat(chat_id):
+    user_id = get_jwt_identity()
+    chat = Chat.query.filter_by(id=chat_id, user_id=int(user_id)).first()
+    if not chat:
+        return jsonify({'error': 'Chat not found'}), 404
+    db.session.delete(chat)
+    db.session.commit()
+    return jsonify({'message': 'Chat deleted'})
+
+@app.route('/chats/<int:chat_id>/messages', methods=['GET'])
+@jwt_required()
+def get_messages(chat_id):
+    user_id = get_jwt_identity()
+    chat = Chat.query.filter_by(id=chat_id, user_id=int(user_id)).first()
+    if not chat:
+        return jsonify({'error': 'Chat not found'}), 404
+    messages = Message.query.filter_by(chat_id=chat_id).order_by(Message.created_at).all()
+    return jsonify({'messages': [m.to_dict() for m in messages]})
+
+# ─── Main Chat Route ─────────────────────────────────────────
+
+@app.route('/chat', methods=['POST'])
+@jwt_required()
+def chat():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+
         if not data or 'message' not in data:
             return jsonify({'error': 'No message provided'}), 400
 
         user_message = data['message'].strip()
+        chat_id = data.get('chat_id')
+
         if not user_message:
             return jsonify({'error': 'Empty message'}), 400
 
-        if is_non_cutoff_query(user_message):
-            response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": DOCUMENT_KNOWLEDGE},
-                    {"role": "user", "content": user_message}
-                ],
-                max_tokens=600,
-                temperature=0.3
-            )
-            answer = response.choices[0].message.content.strip()
-            sources = []
-
+        # Get or create chat
+        if chat_id:
+            chat_obj = Chat.query.filter_by(id=chat_id, user_id=int(user_id)).first()
+            if not chat_obj:
+                return jsonify({'error': 'Chat not found'}), 404
         else:
-            percentile_match = re.search(
-                r'(\d{2,3}(?:\.\d+)?)\s*percentile',
-                user_message.lower()
-            )
-            user_percentile = float(percentile_match.group(1)) if percentile_match else None
+            chat_obj = Chat(user_id=int(user_id), title='New conversation')
+            db.session.add(chat_obj)
+            db.session.flush()
 
-            chunks = retrieve_with_expansion(user_message, n_results=20)
+        # Save user message
+        user_msg = Message(
+            chat_id=chat_obj.id,
+            role='user',
+            content=user_message,
+            sources='[]',
+            suggestions='[]'
+        )
+        db.session.add(user_msg)
 
-            if user_percentile:
-                safe, ambitious, out_of_reach = categorize_chunks(chunks, user_percentile)
+        # Process through RAG pipeline
+        answer, sources, suggestions = process_chat_message(user_message)
 
-                context_parts = []
+        # Save bot message
+        bot_msg = Message(
+            chat_id=chat_obj.id,
+            role='bot',
+            content=answer,
+            sources=json.dumps(sources),
+            suggestions=json.dumps(suggestions)
+        )
+        db.session.add(bot_msg)
 
-                if safe:
-                    context_parts.append("=== SAFE OPTIONS (cutoff BELOW student percentile — student qualifies) ===")
-                    for c in safe[:5]:
-                        m = c['metadata']
-                        context_parts.append(
-                            f"SAFE | {m['college_name']} | {m['branch_name']} | "
-                            f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
-                            f"{m['year']} Round {m['round']}"
-                        )
+        # Update chat title from first user message
+        if chat_obj.title == 'New conversation':
+            chat_obj.title = user_message[:50] + ('…' if len(user_message) > 50 else '')
 
-                if ambitious:
-                    context_parts.append("=== AMBITIOUS OPTIONS (cutoff 1-5 points above student percentile) ===")
-                    for c in ambitious[:3]:
-                        m = c['metadata']
-                        context_parts.append(
-                            f"AMBITIOUS | {m['college_name']} | {m['branch_name']} | "
-                            f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
-                            f"{m['year']} Round {m['round']}"
-                        )
-
-                if out_of_reach:
-                    context_parts.append("=== OUT OF REACH (cutoff more than 5 points above) ===")
-                    for c in out_of_reach[:2]:
-                        m = c['metadata']
-                        context_parts.append(
-                            f"OUT OF REACH | {m['college_name']} | {m['branch_name']} | "
-                            f"{m['category']} | Cutoff: {float(m['percentile']):.2f}% | "
-                            f"{m['year']} Round {m['round']}"
-                        )
-
-                structured_context = "\n".join(context_parts)
-
-                prompt = f"""Student's MHT CET percentile: {user_percentile}
-                Student's question: {user_message}
-
-                Pre-categorized college data (already mathematically correct — do NOT change):
-
-                {structured_context}
-
-                Present this to the student clearly. For EVERY college mention:
-                - College name
-                - Branch name  
-                - Cutoff percentile (exact number)
-                - Year and round
-                Do NOT recalculate or change any categorization.
-                End with a clear recommendation."""
-
-                response = client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=600,
-                    temperature=0.2
-                )
-                answer = response.choices[0].message.content.strip()
-                all_chunks = safe + ambitious + out_of_reach
-
-            else:
-                answer = generate_answer(user_message, chunks)
-                all_chunks = chunks
-
-            sources = [{
-                'college': c['metadata'].get('college_name', ''),
-                'branch': c['metadata'].get('branch_name', ''),
-                'year': c['metadata'].get('year', ''),
-                'category': c['metadata'].get('category', ''),
-                'percentile': c['metadata'].get('percentile', ''),
-                'relevance': round(c['relevance_score'], 3)
-            } for c in all_chunks[:5]]
-
-        suggestions = generate_followup_suggestions(user_message, answer)
+        from datetime import datetime
+        chat_obj.updated_at = datetime.utcnow()
+        db.session.commit()
 
         return jsonify({
             'answer': answer,
             'sources': sources,
-            'suggestions': suggestions
+            'suggestions': suggestions,
+            'chat_id': chat_obj.id,
+            'chat_title': chat_obj.title
         })
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Chat error: {e}")
         import traceback
         traceback.print_exc()
+        db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
+
+# ─── Init DB ─────────────────────────────────────────────────
+
+with app.app_context():
+    db.create_all()
+    print("Database initialized.")
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
