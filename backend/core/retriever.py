@@ -1,64 +1,32 @@
 import chromadb
 import os
-import requests
+import google.generativeai as genai
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 CHROMA_PATH = Path(__file__).parent.parent / 'chroma_db'
 
-HF_API_KEY = os.getenv("HF_API_KEY", "")
-HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+# Configure Gemini
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-def get_embedding(text):
-    """Get embedding via HuggingFace API in production, local model in development"""
-    if HF_API_KEY:
-        # Production — use HF API
-        response = requests.post(
-            HF_API_URL,
-            headers={"Authorization": f"Bearer {HF_API_KEY}"},
-            json={"inputs": text, "options": {"wait_for_model": True}}
-        )
-        return response.json()
-    else:
-        # Development — use local model
-        from sentence_transformers import SentenceTransformer
-        if not hasattr(get_embedding, '_model'):
-            print("Loading embedding model...")
-            get_embedding._model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("Model ready.")
-        return get_embedding._model.encode(text).tolist()
-
-print("Retriever initialized.")
+print("Connecting to ChromaDB...")
 client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = client.get_collection("admission_data")
+print("ChromaDB ready.")
 
-def detect_filters(query_lower):
-    from expander import COLLEGE_ALIASES, detect_category
-
-    type_filter = None
-    college_filter = None
-    category_filter = None
-
-    # Detect seat type
-    if any(w in query_lower for w in ['cet', 'mht cet', 'state quota', 'mh quota']):
-        type_filter = 'MH'
-    elif any(w in query_lower for w in ['jee', 'all india', 'ai quota', 'ai seats']):
-        type_filter = 'AI'
-
-    # Detect college
-    for alias, full_name in COLLEGE_ALIASES.items():
-        if alias in query_lower:
-            college_filter = full_name
-            break
-
-    # Detect category
-    category_filter = detect_category(query_lower)
-
-    return type_filter, college_filter, category_filter
+def get_embedding(text):
+    """Get embedding using Gemini API"""
+    result = genai.embed_content(
+        model="models/text-embedding-004",
+        content=text,
+        task_type="retrieval_query"
+    )
+    return result['embedding']
 
 def retrieve(query, n_results=5, where=None):
     query_embedding = get_embedding(query)
-    if isinstance(query_embedding[0], list):
-        query_embedding = query_embedding[0]
 
     fetch_count = min(n_results * 4, 100)
 
@@ -96,6 +64,27 @@ def retrieve(query, n_results=5, where=None):
 
     return chunks
 
+def detect_filters(query_lower):
+    from expander import COLLEGE_ALIASES, detect_category
+
+    type_filter = None
+    college_filter = None
+    category_filter = None
+
+    if any(w in query_lower for w in ['cet', 'mht cet', 'state quota', 'mh quota']):
+        type_filter = 'MH'
+    elif any(w in query_lower for w in ['jee', 'all india', 'ai quota', 'ai seats']):
+        type_filter = 'AI'
+
+    for alias, full_name in COLLEGE_ALIASES.items():
+        if alias in query_lower:
+            college_filter = full_name
+            break
+
+    category_filter = detect_category(query_lower)
+
+    return type_filter, college_filter, category_filter
+
 def retrieve_with_expansion(user_query, n_results=5):
     from expander import expand_query
     import re
@@ -109,11 +98,9 @@ def retrieve_with_expansion(user_query, n_results=5):
 
     percentile_match = re.search(r'(\d{2,3}(?:\.\d+)?)\s*percentile', query_lower)
     user_percentile = float(percentile_match.group(1)) if percentile_match else None
-
     print(f"Percentile: {user_percentile}")
 
     conditions = []
-
     if type_filter:
         conditions.append({"type": {"$eq": type_filter}})
     if college_filter:
@@ -137,7 +124,6 @@ def retrieve_with_expansion(user_query, n_results=5):
                 return results
         except Exception as e:
             print(f"Filtered search failed: {e}")
-            # Retry without percentile filter
             non_percentile = [c for c in conditions if "percentile" not in str(c)]
             if non_percentile:
                 where2 = non_percentile[0] if len(non_percentile) == 1 else {"$and": non_percentile}
