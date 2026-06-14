@@ -19,7 +19,10 @@ from retriever import retrieve_with_expansion
 from generator import generate_answer
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173"])
+CORS(app, origins=[
+    "http://localhost:5173",
+    "https://rag-admission-bot.vercel.app"
+])
 
 # Config
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///admissions.db'
